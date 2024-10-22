@@ -1,0 +1,103 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.arima.model import ARIMA
+import plotly.graph_objs as go
+from dash import Dash, dcc, html, Input, Output
+
+# Load the dataset
+data = pd.read_csv("D:\coding/banking.csv")
+
+# Convert transaction_date to datetime format
+data['transaction_date'] = pd.to_datetime(data['transaction_date'])
+
+# RFM Analysis
+now = pd.Timestamp.now()
+rfm = data.groupby('account_number').agg({
+    'transaction_date': lambda x: (now - x.max()).days,  # Recency
+    'transaction_time': 'count',  # Frequency
+    'credit_amount': 'sum'  # Monetary
+}).reset_index()
+
+rfm.columns = ['account_number', 'recency', 'frequency', 'monetary']
+
+# K-Means Clustering
+scaler = StandardScaler()
+rfm_scaled = scaler.fit_transform(rfm[['recency', 'frequency', 'monetary']])
+
+# Determine the number of clusters
+kmeans = KMeans(n_clusters=4, random_state=42)
+rfm['cluster'] = kmeans.fit_predict(rfm_scaled)
+
+# Map cluster numbers to segment names
+cluster_mapping = {0: 'Low Value', 1: 'Medium Value', 2: 'High Value', 3: 'Very High Value'}
+rfm['segment'] = rfm['cluster'].map(cluster_mapping)
+
+# Calculate CLV for each segment
+weights = {'recency': -1, 'frequency': 1, 'monetary': 1}
+rfm['clv'] = (weights['recency'] * rfm['recency'] +
+              weights['frequency'] * rfm['frequency'] +
+              weights['monetary'] * rfm['monetary'])
+
+# Initialize Dash app
+app = Dash(__name__)
+
+# Layout of the app
+app.layout = html.Div([
+    html.H1("Customer Lifetime Value Forecasting"),
+    dcc.Dropdown(
+        id='segment-dropdown',
+        options=[{'label': segment, 'value': segment} for segment in rfm['segment'].unique()],
+        value=rfm['segment'].unique()[0]  # Default to first segment
+    ),
+    dcc.Graph(id='clv-forecast-graph'),
+])
+
+# Callback to update the graph based on selected segment
+@app.callback(
+    Output('clv-forecast-graph', 'figure'),
+    Input('segment-dropdown', 'value')
+)
+def update_clv_forecast_graph(selected_segment):
+    # Aggregate CLV by account number
+    segment_data = rfm[rfm['segment'] == selected_segment].groupby('account_number')['clv'].sum()
+
+    # Create a DataFrame with a date range as index
+    clv_time_series = pd.Series(segment_data.values, index=pd.date_range(start=now - pd.Timedelta(days=len(segment_data)), periods=len(segment_data), freq='ME'))
+
+    # Fit the ARIMA model
+    model = ARIMA(clv_time_series, order=(1, 1, 1))
+    model_fit = model.fit()
+
+    # Forecast future values
+    forecast = model_fit.forecast(steps=12)  # Forecast for the next 12 periods
+    forecast_index = pd.date_range(start=clv_time_series.index[-1] + pd.DateOffset(months=1), periods=12, freq='ME')
+
+    forecast_fig = go.Figure()
+    forecast_fig.add_trace(go.Scatter(
+        x=clv_time_series.index,
+        y=clv_time_series,
+        mode='lines+markers',
+        name='Historical CLV'
+    ))
+
+    forecast_fig.add_trace(go.Scatter(
+        x=forecast_index,
+        y=forecast,
+        mode='lines+markers',
+        name='Forecasted CLV',
+        line=dict(color='orange')
+    ))
+
+    forecast_fig.update_layout(title=f'CLV Forecast for {selected_segment} Segment',
+                               xaxis_title='Date',
+                               yaxis_title='CLV',
+                               template='plotly_white')
+
+    return forecast_fig
+
+# Run the app
+if __name__ == '__main__':
+    app.run_server(debug=True)
